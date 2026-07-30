@@ -1,4 +1,17 @@
-export type TaskFn = () => void | Promise<void>;
+/**
+ * The automatic variables make provides inside a recipe, passed to every task
+ * function.
+ */
+export interface TaskContext {
+  /** make's `$@`: the name of the task being run. */
+  target: string;
+  /** make's `$^`: this task's dependencies, in order, without duplicates. */
+  deps: string[];
+  /** make's `$<`: the first dependency, or undefined if there are none. */
+  firstDep: string | undefined;
+}
+
+export type TaskFn = (ctx: TaskContext) => void | Promise<void>;
 
 interface Task {
   name: string;
@@ -22,27 +35,33 @@ export function desc(comment: string): void {
 
 /**
   * Registers a task with the given name, optional dependencies, and function.
-  * @param name - The name of the task.
+  * Passing several names registers the same dependencies and function under
+  * each one, like a make rule with multiple targets. Each name is then its own
+  * task, and receives its own name as `ctx.target`.
+  * @param name - The name of the task, or several names sharing one function.
   * @param depsOrFn - An array of dependency task names or the task function itself.
   * @param fn - The task function (if dependencies are provided).
   */
-export function task(name: string, fn: TaskFn): void;
-export function task(name: string, deps: string[] | TaskFn, fn?: TaskFn): void;
-export function task(name: string, depsOrFn: string[] | TaskFn, fn?: TaskFn): void {
-  const deps: string[] = Array.isArray(depsOrFn) ? depsOrFn : [];
+export function task(name: string | string[], fn: TaskFn): void;
+export function task(name: string | string[], deps: string[] | TaskFn, fn?: TaskFn): void;
+export function task(name: string | string[], depsOrFn: string[] | TaskFn, fn?: TaskFn): void {
+  const rawDeps: string[] = Array.isArray(depsOrFn) ? depsOrFn : [];
+  const deps: string[] = Array.from(new Set(rawDeps));
   const taskFn: TaskFn = typeof depsOrFn === 'function' ? depsOrFn : typeof fn === 'function' ? fn : () => { };
 
-  if (registry.has(name)) {
-    throw new Error(`Task with name "${name}" is already registered.`);
-  }
+  for (const target of Array.isArray(name) ? name : [name]) {
+    if (registry.has(target)) {
+      throw new Error(`Task with name "${target}" is already registered.`);
+    }
 
-  registry.set(name, {
-    name,
-    fn: taskFn,
-    desc: currentDesc,
-    deps,
-    executed: false,
-  });
+    registry.set(target, {
+      name: target,
+      fn: taskFn,
+      desc: currentDesc,
+      deps,
+      executed: false,
+    });
+  }
 
   currentDesc = undefined; // Reset the description after registering the task
 }
@@ -66,7 +85,11 @@ export async function runTask(name: string): Promise<void> {
     await runTask(dep);
   }
 
-  await task.fn();
+  await task.fn({
+    target: task.name,
+    deps: task.deps,
+    firstDep: task.deps[0],
+  });
   task.executed = true;
 }
 
