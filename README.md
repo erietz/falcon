@@ -137,16 +137,85 @@ task("release", ["build", "test", "publish"], ({ target, deps, firstDep }) => {
 
 Ignore the argument and nothing changes, so `() => {}` is still a task.
 
+## Parallel dependencies
+
+`multitask` takes the same arguments as `task` but starts its dependencies all
+at once instead of one after another, the way rake's `multitask` does:
+
+```ts
+// examples/parallel.ts
+desc("laces up before any drill");
+task("warmup", async () => { await sleep(100); log("warmed up"); });
+
+desc("drills jabs");
+task("jabs", ["warmup"], async ({ target }) => { await sleep(300); log(`${target} done`); });
+// ...kicks (200ms) and punches (400ms), both also depending on warmup
+
+desc("runs every drill at once");
+multitask("training", ["jabs", "kicks", "punches"], ({ deps }) => {
+  log(`${deps.length} drills complete`);
+});
+```
+
+```sh
+$ node examples/parallel.ts training
+  101ms  warmed up
+  306ms  kicks done
+  407ms  jabs done
+  505ms  punches done
+  506ms  3 drills complete
+```
+
+The drills overlap, so the run takes as long as the slowest one instead of the
+sum of all three. Only `training`'s own dependencies overlap: each drill still
+runs its own dependencies in order unless it is a `multitask` too. Swap
+`multitask` back to `task` and the same three drills go one at a time.
+
+Tasks still run at most once, however many dependents ask for them at the same
+time. All three drills depend on `warmup`, so it runs once and all three wait on
+that single run.
+
+A dependency cycle raises `Circular dependency: a -> b -> c -> a`, naming the
+path, rather than hanging.
+
+Tasks named on the command line always run in order, so
+`node examples/dbmate.ts drop create up` still means what it says.
+
+### Limiting jobs
+
+`FALCON_JOBS` caps how many task functions run at once, like make's `-j`:
+
+```sh
+$ FALCON_JOBS=1 node examples/parallel.ts training
+  102ms  warmed up
+  407ms  jabs done
+  610ms  kicks done
+ 1013ms  punches done
+ 1014ms  3 drills complete
+```
+
+Leave it unset for no limit. The cap counts task functions only, so a task never
+holds a slot while waiting on its dependencies.
+
 ## API
 
-That's it. Three functions:
+That's it. Four functions:
 
 - `desc(text)`: description for the next task
 - `task(name, [deps], fn)`: register a task, where `name` is one name or an
   array of them, and `fn` receives `{ target, deps, firstDep }`
+- `multitask(name, [deps], fn)`: the same, but the dependencies run at once
 - `run()`:  run the tasks named in `process.argv`, or list them all
 
 ## Notes
 
 Running `.ts` files directly needs Node 22.18+ or 24+ (native type stripping).
 Older versions work too just compile first, or use `tsx`.
+
+A failed dependency stops the run, but its siblings already underway are not
+cancelled, since nothing in JavaScript can cancel them. They finish, and then the
+error surfaces. Make behaves much the same, waiting on its outstanding jobs
+before it gives up.
+
+Tasks running at once write to the same stdout, so their output interleaves.
+There is no equivalent of make's `--output-sync`.
