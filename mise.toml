@@ -1,2 +1,8 @@
 [tools]
 node = '24'
+
+[tasks]
+[tasks.publish]
+description = 'Publish the package to npm'
+confirm = 'Are you sure you want to publish the package to npm?'
+run = 'npm publish --access public'
