@@ -18,11 +18,47 @@ interface Task {
   fn: TaskFn;
   desc: string | undefined;
   deps: string[];
-  executed: boolean;
+  parallel: boolean;
+  /**
+   * The run of this task, memoized so that a task shared by several dependents
+   * runs once and every dependent awaits the same run.
+   */
+  promise: Promise<void> | undefined;
 }
 
 const registry: Map<string, Task> = new Map();
 let currentDesc: string | undefined;
+
+/**
+ * The most task functions to run at once, from `FALCON_JOBS`, like make's `-j`.
+ * Anything unparseable or non-positive means no limit.
+ */
+const jobs: number = (() => {
+  const parsed = Number(process.env.FALCON_JOBS);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : Infinity;
+})();
+let active = 0;
+const waiting: (() => void)[] = [];
+
+/**
+ * Runs one task function, waiting for a free job slot first. Only the function
+ * itself holds a slot: a task that held one while awaiting its dependencies
+ * would deadlock at `FALCON_JOBS=1`, since those dependencies need slots too.
+ */
+async function withSlot(fn: () => void | Promise<void>): Promise<void> {
+  // Waiting in a loop, not an if: a woken task rechecks in case another one
+  // took the slot first, rather than pushing the count past the limit.
+  while (active >= jobs) {
+    await new Promise<void>(resolve => waiting.push(resolve));
+  }
+  active++;
+  try {
+    await fn();
+  } finally {
+    active--;
+    waiting.shift()?.();
+  }
+}
 
 /**
   * Sets the description for the next task to be registered.
@@ -45,6 +81,25 @@ export function desc(comment: string): void {
 export function task(name: string | string[], fn: TaskFn): void;
 export function task(name: string | string[], deps: string[] | TaskFn, fn?: TaskFn): void;
 export function task(name: string | string[], depsOrFn: string[] | TaskFn, fn?: TaskFn): void {
+  define(name, depsOrFn, fn, false);
+}
+
+/**
+  * Registers a task whose dependencies run in parallel instead of in order,
+  * like rake's `multitask`. Takes the same arguments as {@link task}. Only this
+  * task's own dependencies overlap; each of them still runs its own
+  * dependencies in order unless it is a multitask too.
+  * @param name - The name of the task, or several names sharing one function.
+  * @param depsOrFn - An array of dependency task names or the task function itself.
+  * @param fn - The task function (if dependencies are provided).
+  */
+export function multitask(name: string | string[], fn: TaskFn): void;
+export function multitask(name: string | string[], deps: string[] | TaskFn, fn?: TaskFn): void;
+export function multitask(name: string | string[], depsOrFn: string[] | TaskFn, fn?: TaskFn): void {
+  define(name, depsOrFn, fn, true);
+}
+
+function define(name: string | string[], depsOrFn: string[] | TaskFn, fn: TaskFn | undefined, parallel: boolean): void {
   const rawDeps: string[] = Array.isArray(depsOrFn) ? depsOrFn : [];
   const deps: string[] = Array.from(new Set(rawDeps));
   const taskFn: TaskFn = typeof depsOrFn === 'function' ? depsOrFn : typeof fn === 'function' ? fn : () => { };
@@ -59,7 +114,8 @@ export function task(name: string | string[], depsOrFn: string[] | TaskFn, fn?: 
       fn: taskFn,
       desc: currentDesc,
       deps,
-      executed: false,
+      parallel,
+      promise: undefined,
     });
   }
 
@@ -70,27 +126,36 @@ export function task(name: string | string[], depsOrFn: string[] | TaskFn, fn?: 
  * Runs the specified task and its dependencies in the correct order. If a task
 * has already been executed, it will not be run again.
  * @param name - The name of the task to run.
+ * @param path - The chain of tasks depended upon to reach this one, used to
+ * report circular dependencies. Callers should leave it empty.
  */
-export async function runTask(name: string): Promise<void> {
+export async function runTask(name: string, path: string[] = []): Promise<void> {
   const task = registry.get(name);
   if (!task) {
     throw new Error(`Task with name "${name}" is not registered.`);
   }
 
-  if (task.executed) {
-    return;
+  if (path.includes(name)) {
+    throw new Error(`Circular dependency: ${[...path, name].join(' -> ')}`);
   }
 
-  for (const dep of task.deps) {
-    await runTask(dep);
+  return (task.promise ??= execute(task, [...path, name]));
+}
+
+async function execute(task: Task, path: string[]): Promise<void> {
+  if (task.parallel) {
+    await Promise.all(task.deps.map(dep => runTask(dep, path)));
+  } else {
+    for (const dep of task.deps) {
+      await runTask(dep, path);
+    }
   }
 
-  await task.fn({
+  await withSlot(() => task.fn({
     target: task.name,
     deps: task.deps,
     firstDep: task.deps[0],
-  });
-  task.executed = true;
+  }));
 }
 
 /**
