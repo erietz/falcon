@@ -6,7 +6,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "check": "npx @biomejs/biome check --write"
   },
   "files": [
     "dist/**/*",
@@ -25,6 +26,7 @@
   },
   "homepage": "https://github.com/erietz/falcon#readme",
   "devDependencies": {
+    "@biomejs/biome": "2.5.11",
     "@types/node": "^26.1.2",
     "typescript": "^7.0.2"
   }
