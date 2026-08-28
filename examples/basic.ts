@@ -1,4 +1,4 @@
-import { task, desc, run } from "../dist/index.js";
+import { desc, run, task } from "../dist/index.js";
 
 desc("punches the opponent");
 task("punch", async () => {

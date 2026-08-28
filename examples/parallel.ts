@@ -4,7 +4,7 @@
 // Set FALCON_JOBS to cap how many task functions run at a time, like make -j.
 
 import { setTimeout as sleep } from "node:timers/promises";
-import { task, multitask, desc, run } from "../dist/index.js";
+import { desc, multitask, run, task } from "../dist/index.js";
 
 const start = Date.now();
 const log = (msg: string) =>
