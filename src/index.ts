@@ -1,3 +1,13 @@
+import { parseArgs } from "node:util";
+
+const options = {
+  parallel: {
+    type: "boolean",
+    default: false,
+    short: "j",
+  },
+} as const;
+
 /**
  * The automatic variables make provides inside a recipe, passed to every task
  * function.
@@ -212,10 +222,18 @@ function listTasks(): void {
  * provided, it lists all available tasks.
  */
 export async function run(): Promise<void> {
-  const args = process.argv.slice(2);
-  if (args.length > 0) {
-    for (const arg of args) {
-      await runTask(arg);
+  const { values, positionals } = parseArgs({
+    options,
+    allowPositionals: true,
+  });
+
+  if (positionals.length > 0) {
+    if (values.parallel) {
+      await Promise.all(positionals.map((p) => runTask(p)));
+    } else {
+      for (const p of positionals) {
+        await runTask(p);
+      }
     }
   } else {
     listTasks();
