@@ -2,7 +2,26 @@
 node = '24'
 
 [tasks]
+
+[tasks.bump-version]
+usage = 'arg "<version_change_type>"'
+run = '''
+#!/usr/bin/env bash
+npm version {{usage.version_change_type}} -m "Bump version to %s"
+git push origin main
+git push origin main --tags
+'''
+
 [tasks.publish]
 description = 'Publish the package to npm'
 confirm = 'Are you sure you want to publish the package to npm?'
+usage = '''
+arg "<version_change_type>" {
+	choices "patch" "minor" "major"
+	help "Specify the type of version bump to perform (patch, minor, or major)."
+}
+'''
+depends = [
+	{ task = 'bump-version', args = ['{{usage.version_change_type}}' ]}
+]
 run = 'npm publish --access public'
