@@ -3,15 +3,19 @@
   "version": "1.2.3",
   "description": "",
   "main": "dist/index.js",
+  "bin": {
+    "falcon": "./bin/falcon.js"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test test/*.test.ts",
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "check": "npx @biomejs/biome check --write"
   },
   "files": [
     "dist/**/*",
-    "assets/**/*"
+    "assets/**/*",
+    "bin/**/*"
   ],
   "repository": {
     "type": "git",
