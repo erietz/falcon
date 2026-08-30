@@ -10,4 +10,7 @@ const srcEntry = join(__dirname, "../src/index.ts");
 const entry = existsSync(distEntry) ? distEntry : srcEntry;
 const { cli } = await import(entry);
 
-await cli();
+const exitCode = await cli();
+if (exitCode !== 0) {
+  process.exit(exitCode);
+}

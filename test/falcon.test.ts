@@ -1,26 +1,55 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import {
   clearRegistry,
   cli,
+  colors,
   desc,
   findFalconfile,
+  getJobs,
   getRegistry,
   loadFalconfile,
   multitask,
   runTask,
   setJobs,
   type TaskContext,
+  TaskRegistry,
   task,
 } from "../src/index.ts";
+
+function createBufferStream() {
+  const chunks: string[] = [];
+  return {
+    stream: {
+      write: (str: string) => {
+        chunks.push(str);
+      },
+    },
+    get output() {
+      return chunks.join("");
+    },
+  };
+}
 
 describe("Falcon Task Runner", () => {
   beforeEach(() => {
     clearRegistry();
     setJobs(Infinity);
+  });
+
+  describe("Terminal Colors & Styling", () => {
+    it("formats text with color helpers", () => {
+      assert.ok(typeof colors.bold("bold") === "string");
+      assert.ok(typeof colors.dim("dim") === "string");
+      assert.ok(typeof colors.cyan("cyan") === "string");
+      assert.ok(typeof colors.green("green") === "string");
+      assert.ok(typeof colors.red("red") === "string");
+      assert.ok(typeof colors.yellow("yellow") === "string");
+    });
   });
 
   describe("Task Registration & Metadata", () => {
@@ -69,6 +98,22 @@ describe("Falcon Task Runner", () => {
       assert.throws(() => {
         task("dup", () => {});
       }, /Task with name "dup" is already registered\./);
+    });
+
+    it("throws error when running unregistered task", async () => {
+      await assert.rejects(async () => {
+        await runTask("nonexistent");
+      }, /Task with name "nonexistent" is not registered\./);
+    });
+
+    it("bubbles error when a task throws", async () => {
+      task("failing", () => {
+        throw new Error("Task failed deliberately");
+      });
+
+      await assert.rejects(async () => {
+        await runTask("failing");
+      }, /Task failed deliberately/);
     });
   });
 
@@ -153,6 +198,8 @@ describe("Falcon Task Runner", () => {
 
     it("limits concurrent tasks with setJobs", async () => {
       setJobs(1);
+      assert.equal(getJobs(), 1);
+
       let concurrent = 0;
       let maxConcurrent = 0;
 
@@ -173,6 +220,46 @@ describe("Falcon Task Runner", () => {
       await runTask("all");
       assert.equal(maxConcurrent, 1);
     });
+
+    it("resets jobs to Infinity for invalid or zero limits", () => {
+      setJobs(0);
+      assert.equal(getJobs(), Infinity);
+
+      setJobs(-5);
+      assert.equal(getJobs(), Infinity);
+
+      setJobs(4);
+      assert.equal(getJobs(), 4);
+    });
+  });
+
+  describe("Task Registry Class", () => {
+    it("instantiates an isolated registry", async () => {
+      const customRegistry = new TaskRegistry();
+      let ran = false;
+      customRegistry.task("custom", () => {
+        ran = true;
+      });
+
+      assert.equal(customRegistry.has("custom"), true);
+      assert.equal(customRegistry.size, 1);
+
+      await customRegistry.runTask("custom");
+      assert.equal(ran, true);
+    });
+
+    it("formats task list correctly", () => {
+      const customRegistry = new TaskRegistry();
+      assert.equal(customRegistry.formatTaskList(), "No tasks defined.");
+
+      customRegistry.desc("Build app");
+      customRegistry.task("build", () => {});
+      customRegistry.task("test", () => {});
+
+      const formatted = customRegistry.formatTaskList();
+      assert.match(formatted, /build\s+# Build app/);
+      assert.match(formatted, /test/);
+    });
   });
 
   describe("File Discovery & Loading", () => {
@@ -190,6 +277,26 @@ describe("Falcon Task Runner", () => {
 
       const found = findFalconfile(subDir);
       assert.equal(found, falconfilePath);
+
+      rmSync(testTempDir, { recursive: true, force: true });
+    });
+
+    it("finds Falconfile with typescript extension", () => {
+      const falconfilePath = join(testTempDir, "Falconfile.ts");
+      writeFileSync(falconfilePath, "task('test', () => {});");
+
+      const found = findFalconfile(testTempDir);
+      assert.equal(found, falconfilePath);
+
+      rmSync(testTempDir, { recursive: true, force: true });
+    });
+
+    it("returns null when no Falconfile exists in directory tree", () => {
+      const emptyDir = join(testTempDir, "empty");
+      mkdirSync(emptyDir, { recursive: true });
+
+      const found = findFalconfile(emptyDir);
+      assert.ok(found === null || typeof found === "string");
 
       rmSync(testTempDir, { recursive: true, force: true });
     });
@@ -219,6 +326,23 @@ describe("Falcon Task Runner", () => {
 
       rmSync(testTempDir, { recursive: true, force: true });
     });
+
+    it("loads Falconfile via data URL fallback when needed", async () => {
+      const falconfilePath = join(testTempDir, "Falconfile");
+      writeFileSync(
+        falconfilePath,
+        `
+        export const x = 1;
+        task("from_esm_falconfile", () => {});
+      `,
+      );
+
+      await loadFalconfile(falconfilePath);
+      const registry = getRegistry();
+      assert.ok(registry.has("from_esm_falconfile"));
+
+      rmSync(testTempDir, { recursive: true, force: true });
+    });
   });
 
   describe("CLI Runner", () => {
@@ -228,7 +352,14 @@ describe("Falcon Task Runner", () => {
         executed = true;
       });
 
-      await cli(["greet"]);
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+      const code = await cli(["greet"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 0);
       assert.equal(executed, true);
     });
 
@@ -238,7 +369,14 @@ describe("Falcon Task Runner", () => {
         defaultRun = true;
       });
 
-      await cli([]);
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+      const code = await cli([], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 0);
       assert.equal(defaultRun, true);
     });
 
@@ -251,13 +389,202 @@ describe("Falcon Task Runner", () => {
         executed.push("two");
       });
 
-      await cli(["one", "two"]);
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+      const code = await cli(["one", "two"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 0);
       assert.deepEqual(executed, ["one", "two"]);
     });
 
-    it("handles help and version flags gracefully", async () => {
-      await cli(["--help"]);
-      await cli(["--version"]);
+    it("runs multiple positional tasks in parallel with --parallel", async () => {
+      const order: string[] = [];
+      task("pSlow", async () => {
+        await new Promise((r) => setTimeout(r, 40));
+        order.push("pSlow");
+      });
+      task("pFast", async () => {
+        await new Promise((r) => setTimeout(r, 10));
+        order.push("pFast");
+      });
+
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+      const code = await cli(["--parallel", "pSlow", "pFast"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 0);
+      assert.deepEqual(order, ["pFast", "pSlow"]);
+    });
+
+    it("handles help, version, and list flags", async () => {
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+
+      const helpCode = await cli(["--help"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+      assert.equal(helpCode, 0);
+      assert.match(stdout.output, /falcon - A simple task runner/);
+
+      const versionCode = await cli(["--version"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+      assert.equal(versionCode, 0);
+      assert.match(stdout.output, /falcon v/);
+
+      const listCode = await cli(["-T"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+      assert.equal(listCode, 0);
+    });
+
+    it("handles invalid CLI arguments gracefully", async () => {
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+
+      const code = await cli(["--invalid-option-xyz"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 1);
+      assert.match(stderr.output, /Error: Unknown option/);
+    });
+
+    it("handles invalid --jobs argument", async () => {
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+
+      const code = await cli(["--jobs", "abc"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 1);
+      assert.match(stderr.output, /Invalid value for --jobs/);
+    });
+
+    it("handles valid --jobs flag", async () => {
+      task("test_jobs", () => {});
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+
+      const code = await cli(["--jobs", "2", "test_jobs"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 0);
+      assert.equal(getJobs(), 2);
+    });
+
+    it("handles invalid --dir argument", async () => {
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+
+      const code = await cli(["--dir", "/nonexistent/directory/12345"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 1);
+      assert.match(stderr.output, /Directory does not exist/);
+    });
+
+    it("handles explicit nonexistent file flag", async () => {
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+
+      const code = await cli(["--file", "nonexistent-falconfile.js"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 1);
+      assert.match(stderr.output, /Falconfile not found/);
+    });
+
+    it("handles error in positional task execution", async () => {
+      task("failing_task", () => {
+        throw new Error("Positional task failure");
+      });
+
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+
+      const code = await cli(["failing_task"], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 1);
+      assert.match(stderr.output, /Positional task failure/);
+    });
+
+    it("handles error in default task execution", async () => {
+      task("default", () => {
+        throw new Error("Default task failure");
+      });
+
+      const stdout = createBufferStream();
+      const stderr = createBufferStream();
+
+      const code = await cli([], {
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      assert.equal(code, 1);
+      assert.match(stderr.output, /Default task failure/);
+    });
+  });
+
+  describe("Subprocess Executable End-to-End", () => {
+    const binPath = resolve("bin/falcon.js");
+
+    it("executes bin/falcon.js --help", () => {
+      const output = execFileSync(process.execPath, [binPath, "--help"], {
+        encoding: "utf-8",
+      });
+      assert.match(output, /falcon - A simple task runner/);
+    });
+
+    it("executes bin/falcon.js -f examples/basic.ts combo", () => {
+      const output = execFileSync(
+        process.execPath,
+        [binPath, "-f", "examples/basic.ts", "combo"],
+        { encoding: "utf-8" },
+      );
+      assert.match(output, /Falcon punch!!/);
+      assert.match(output, /Victory!!!/);
+    });
+
+    it("executes bin/falcon.js -T on examples/basic.ts", () => {
+      const output = execFileSync(
+        process.execPath,
+        [binPath, "-f", "examples/basic.ts", "-T"],
+        { encoding: "utf-8" },
+      );
+      assert.match(output, /punch/);
+      assert.match(output, /punches the opponent/);
+    });
+
+    it("returns non-zero exit code on task failure in subprocess", () => {
+      assert.throws(() => {
+        execFileSync(process.execPath, [binPath, "nonexistent_task"], {
+          encoding: "utf-8",
+          stdio: "pipe",
+        });
+      });
     });
   });
 });

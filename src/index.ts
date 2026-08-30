@@ -62,90 +62,192 @@ export interface Task {
   promise: Promise<void> | undefined;
 }
 
-const g = globalThis as Record<string, unknown>;
-
-if (!g.__FALCON_REGISTRY__) {
-  g.__FALCON_REGISTRY__ = new Map<string, Task>();
-}
-const registry = g.__FALCON_REGISTRY__ as Map<string, Task>;
-let currentDesc: string | undefined;
-
 /**
- * The most task functions to run at once, from `FALCON_JOBS`, like make's `-j`.
- * Anything unparseable or non-positive means no limit.
+ * Registry holding task definitions and handling dependency resolution,
+ * concurrency limiting, and execution.
  */
-let jobs: number = (() => {
-  const parsed = Number(process.env.FALCON_JOBS);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : Infinity;
-})();
-let active = 0;
-const waiting: (() => void)[] = [];
+export class TaskRegistry {
+  private tasks = new Map<string, Task>();
+  private currentDesc: string | undefined;
+  private jobs: number;
+  private active = 0;
+  private waiting: (() => void)[] = [];
 
-/**
- * Sets the concurrency limit for task function execution.
- */
-export function setJobs(limit: number): void {
-  jobs = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : Infinity;
-}
-
-/**
- * Returns current concurrency limit.
- */
-export function getJobs(): number {
-  return jobs;
-}
-
-/**
- * Returns the task registry map.
- */
-export function getRegistry(): Map<string, Task> {
-  return registry;
-}
-
-/**
- * Clears all registered tasks and resets state (useful for tests).
- */
-export function clearRegistry(): void {
-  registry.clear();
-  currentDesc = undefined;
-  active = 0;
-  waiting.length = 0;
-}
-
-/**
- * Runs one task function, waiting for a free job slot first. Only the function
- * itself holds a slot: a task that held one while awaiting its dependencies
- * would deadlock at `FALCON_JOBS=1`, since those dependencies need slots too.
- */
-async function withSlot(fn: () => void | Promise<void>): Promise<void> {
-  while (active >= jobs) {
-    await new Promise<void>((resolve) => waiting.push(resolve));
+  constructor() {
+    const parsed = Number(process.env.FALCON_JOBS);
+    this.jobs =
+      Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : Infinity;
   }
-  active++;
-  try {
-    await fn();
-  } finally {
-    active--;
-    waiting.shift()?.();
+
+  get size(): number {
+    return this.tasks.size;
+  }
+
+  has(name: string): boolean {
+    return this.tasks.has(name);
+  }
+
+  get(name: string): Task | undefined {
+    return this.tasks.get(name);
+  }
+
+  entries(): IterableIterator<[string, Task]> {
+    return this.tasks.entries();
+  }
+
+  keys(): IterableIterator<string> {
+    return this.tasks.keys();
+  }
+
+  desc(comment: string): void {
+    this.currentDesc = comment;
+  }
+
+  task(
+    name: string | string[],
+    depsOrFn: string[] | TaskFn,
+    fn?: TaskFn,
+  ): void {
+    this.define(name, depsOrFn, fn, false);
+  }
+
+  multitask(
+    name: string | string[],
+    depsOrFn: string[] | TaskFn,
+    fn?: TaskFn,
+  ): void {
+    this.define(name, depsOrFn, fn, true);
+  }
+
+  private define(
+    name: string | string[],
+    depsOrFn: string[] | TaskFn,
+    fn: TaskFn | undefined,
+    parallel: boolean,
+  ): void {
+    const rawDeps: string[] = Array.isArray(depsOrFn) ? depsOrFn : [];
+    const deps: string[] = Array.from(new Set(rawDeps));
+    const taskFn: TaskFn =
+      typeof depsOrFn === "function"
+        ? depsOrFn
+        : typeof fn === "function"
+          ? fn
+          : () => {};
+
+    for (const target of Array.isArray(name) ? name : [name]) {
+      if (this.tasks.has(target)) {
+        throw new Error(`Task with name "${target}" is already registered.`);
+      }
+
+      this.tasks.set(target, {
+        name: target,
+        fn: taskFn,
+        desc: this.currentDesc,
+        deps,
+        parallel,
+        promise: undefined,
+      });
+    }
+
+    this.currentDesc = undefined;
+  }
+
+  setJobs(limit: number): void {
+    this.jobs =
+      Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : Infinity;
+  }
+
+  getJobs(): number {
+    return this.jobs;
+  }
+
+  clear(): void {
+    this.tasks.clear();
+    this.currentDesc = undefined;
+    this.active = 0;
+    this.waiting.length = 0;
+  }
+
+  private async withSlot(fn: () => void | Promise<void>): Promise<void> {
+    while (this.active >= this.jobs) {
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
+    }
+    this.active++;
+    try {
+      await fn();
+    } finally {
+      this.active--;
+      this.waiting.shift()?.();
+    }
+  }
+
+  async runTask(name: string, path: string[] = []): Promise<void> {
+    const targetTask = this.tasks.get(name);
+    if (!targetTask) {
+      throw new Error(`Task with name "${name}" is not registered.`);
+    }
+
+    if (path.includes(name)) {
+      throw new Error(`Circular dependency: ${[...path, name].join(" -> ")}`);
+    }
+
+    if (!targetTask.promise) {
+      targetTask.promise = this.execute(targetTask, [...path, name]);
+    }
+
+    return targetTask.promise;
+  }
+
+  private async execute(targetTask: Task, path: string[]): Promise<void> {
+    if (targetTask.parallel) {
+      await Promise.all(targetTask.deps.map((dep) => this.runTask(dep, path)));
+    } else {
+      for (const dep of targetTask.deps) {
+        await this.runTask(dep, path);
+      }
+    }
+
+    await this.withSlot(() =>
+      targetTask.fn({
+        target: targetTask.name,
+        deps: targetTask.deps,
+        firstDep: targetTask.deps[0],
+      }),
+    );
+  }
+
+  formatTaskList(): string {
+    if (this.tasks.size === 0) {
+      return "No tasks defined.";
+    }
+
+    const lines: string[] = ["Available tasks:"];
+    const maxLength = Math.max(
+      ...Array.from(this.tasks.keys()).map((name) => name.length),
+      0,
+    );
+
+    for (const [name, targetTask] of this.tasks.entries()) {
+      const paddedName = name.padEnd(maxLength + 2, " ");
+      const descStr = targetTask.desc ? `# ${targetTask.desc}` : "";
+      lines.push(`  ${paddedName}${descStr}`);
+    }
+
+    return lines.join("\n");
   }
 }
+
+export const defaultRegistry = new TaskRegistry();
 
 /**
  * Sets the description for the next task to be registered.
- * @param comment - The description of the task.
  */
 export function desc(comment: string): void {
-  currentDesc = comment;
+  defaultRegistry.desc(comment);
 }
 
 /**
  * Registers a task with the given name, optional dependencies, and function.
- * Passing several names registers the same dependencies and function under
- * each one, like a make rule with multiple targets. Each name is then its own
- * task, and receives its own name as `ctx.target`.
- * @param name - The name of the task, or several names sharing one function.
- * @param depsOrFn - An array of dependency task names or the task function itself.
- * @param fn - The task function (if dependencies are provided).
  */
 export function task(name: string | string[], fn: TaskFn): void;
 export function task(
@@ -158,17 +260,11 @@ export function task(
   depsOrFn: string[] | TaskFn,
   fn?: TaskFn,
 ): void {
-  define(name, depsOrFn, fn, false);
+  defaultRegistry.task(name, depsOrFn, fn);
 }
 
 /**
- * Registers a task whose dependencies run in parallel instead of in order,
- * like rake's `multitask`. Takes the same arguments as {@link task}. Only this
- * task's own dependencies overlap; each of them still runs its own
- * dependencies in order unless it is a multitask too.
- * @param name - The name of the task, or several names sharing one function.
- * @param depsOrFn - An array of dependency task names or the task function itself.
- * @param fn - The task function (if dependencies are provided).
+ * Registers a task whose dependencies run in parallel.
  */
 export function multitask(name: string | string[], fn: TaskFn): void;
 export function multitask(
@@ -181,51 +277,65 @@ export function multitask(
   depsOrFn: string[] | TaskFn,
   fn?: TaskFn,
 ): void {
-  define(name, depsOrFn, fn, true);
+  defaultRegistry.multitask(name, depsOrFn, fn);
 }
 
-function define(
-  name: string | string[],
-  depsOrFn: string[] | TaskFn,
-  fn: TaskFn | undefined,
-  parallel: boolean,
-): void {
-  const rawDeps: string[] = Array.isArray(depsOrFn) ? depsOrFn : [];
-  const deps: string[] = Array.from(new Set(rawDeps));
-  const taskFn: TaskFn =
-    typeof depsOrFn === "function"
-      ? depsOrFn
-      : typeof fn === "function"
-        ? fn
-        : () => {};
+/**
+ * Runs the specified task on the default registry.
+ */
+export function runTask(name: string): Promise<void> {
+  return defaultRegistry.runTask(name);
+}
 
-  for (const target of Array.isArray(name) ? name : [name]) {
-    if (registry.has(target)) {
-      throw new Error(`Task with name "${target}" is already registered.`);
-    }
+/**
+ * Sets concurrency limit on the default registry.
+ */
+export function setJobs(limit: number): void {
+  defaultRegistry.setJobs(limit);
+}
 
-    registry.set(target, {
-      name: target,
-      fn: taskFn,
-      desc: currentDesc,
-      deps,
-      parallel,
-      promise: undefined,
-    });
+/**
+ * Returns concurrency limit on the default registry.
+ */
+export function getJobs(): number {
+  return defaultRegistry.getJobs();
+}
+
+/**
+ * Clears the default registry.
+ */
+export function clearRegistry(): void {
+  defaultRegistry.clear();
+}
+
+/**
+ * Returns a copy of default task registry map.
+ */
+export function getRegistry(): Map<string, Task> {
+  const map = new Map<string, Task>();
+  for (const [k, v] of defaultRegistry.entries()) {
+    map.set(k, v);
   }
-
-  currentDesc = undefined;
+  return map;
 }
 
 /**
  * Injects DSL functions into globalThis so Falconfiles can run without explicit imports.
  */
-export function injectGlobals(): void {
+export function injectGlobals(registry: TaskRegistry = defaultRegistry): void {
   const g = globalThis as Record<string, unknown>;
-  g.task = task;
-  g.desc = desc;
-  g.multitask = multitask;
-  g.run = run;
+  g.task = (
+    name: string | string[],
+    depsOrFn: string[] | TaskFn,
+    fn?: TaskFn,
+  ) => registry.task(name, depsOrFn, fn);
+  g.desc = (comment: string) => registry.desc(comment);
+  g.multitask = (
+    name: string | string[],
+    depsOrFn: string[] | TaskFn,
+    fn?: TaskFn,
+  ) => registry.multitask(name, depsOrFn, fn);
+  g.run = () => run();
 }
 
 /**
@@ -273,94 +383,49 @@ export function findFalconfile(
   return null;
 }
 
+let loadingCount = 0;
+
+export function isLoadingFalconfile(): boolean {
+  return loadingCount > 0;
+}
+
 /**
  * Loads a Falconfile, injecting globals and executing via dynamic import or vm.
  */
-export async function loadFalconfile(filePath: string): Promise<void> {
-  injectGlobals();
+export async function loadFalconfile(
+  filePath: string,
+  registry: TaskRegistry = defaultRegistry,
+): Promise<void> {
+  injectGlobals(registry);
   const resolvedPath = resolve(filePath);
   const ext = extname(resolvedPath).toLowerCase();
 
-  if (ext === ".js" || ext === ".mjs" || ext === ".cjs" || ext === ".ts") {
-    const fileUrl = pathToFileURL(resolvedPath).href;
-    await import(fileUrl);
-  } else {
-    const content = readFileSync(resolvedPath, "utf-8");
-    try {
-      vm.runInThisContext(content, {
-        filename: resolvedPath,
-      });
-    } catch {
-      const dataUrl = `data:text/javascript;base64,${Buffer.from(content).toString("base64")}`;
-      await import(dataUrl);
+  loadingCount++;
+  try {
+    if (ext === ".js" || ext === ".mjs" || ext === ".cjs" || ext === ".ts") {
+      const fileUrl = pathToFileURL(resolvedPath).href;
+      await import(fileUrl);
+    } else {
+      const content = readFileSync(resolvedPath, "utf-8");
+      try {
+        vm.runInThisContext(content, {
+          filename: resolvedPath,
+        });
+      } catch {
+        const dataUrl = `data:text/javascript;base64,${Buffer.from(content).toString("base64")}`;
+        await import(dataUrl);
+      }
     }
+  } finally {
+    loadingCount--;
   }
 }
 
 /**
- * Runs the specified task and its dependencies in the correct order. If a task
- * has already been executed, it will not be run again.
- * @param name - The name of the task to run.
- * @param path - The chain of tasks depended upon to reach this one, used to
- * report circular dependencies. Callers should leave it empty.
+ * Prints all registered tasks to console.
  */
-export async function runTask(
-  name: string,
-  path: string[] = [],
-): Promise<void> {
-  const targetTask = registry.get(name);
-  if (!targetTask) {
-    throw new Error(`Task with name "${name}" is not registered.`);
-  }
-
-  if (path.includes(name)) {
-    throw new Error(`Circular dependency: ${[...path, name].join(" -> ")}`);
-  }
-
-  if (!targetTask.promise) {
-    targetTask.promise = execute(targetTask, [...path, name]);
-  }
-
-  return targetTask.promise;
-}
-
-async function execute(targetTask: Task, path: string[]): Promise<void> {
-  if (targetTask.parallel) {
-    await Promise.all(targetTask.deps.map((dep) => runTask(dep, path)));
-  } else {
-    for (const dep of targetTask.deps) {
-      await runTask(dep, path);
-    }
-  }
-
-  await withSlot(() =>
-    targetTask.fn({
-      target: targetTask.name,
-      deps: targetTask.deps,
-      firstDep: targetTask.deps[0],
-    }),
-  );
-}
-
-/**
- * Lists all registered tasks with their descriptions.
- */
-export function listTasks(): void {
-  if (registry.size === 0) {
-    console.log("No tasks defined.");
-    return;
-  }
-
-  console.log("Available tasks:");
-  const maxLength = Math.max(
-    ...Array.from(registry.keys()).map((name) => name.length),
-    0,
-  );
-  for (const [name, targetTask] of registry.entries()) {
-    const paddedName = name.padEnd(maxLength + 2, " ");
-    const descStr = targetTask.desc ? `# ${targetTask.desc}` : "";
-    console.log(`  ${colors.cyan(paddedName)}${colors.dim(descStr)}`);
-  }
+export function listTasks(registry: TaskRegistry = defaultRegistry): void {
+  console.log(registry.formatTaskList());
 }
 
 function getPackageVersion(): string {
@@ -373,32 +438,42 @@ function getPackageVersion(): string {
   }
 }
 
-function printHelp(): void {
-  console.log(`
-${colors.bold("falcon")} - A simple task runner. Zero dependencies.
+export function getHelpText(): string {
+  return `
+falcon - A simple task runner. Zero dependencies.
 
-${colors.bold("Usage:")}
+Usage:
   falcon [options] [task...]
 
-${colors.bold("Options:")}
+Options:
   -T, -l, --list        List all available tasks
   -f, --file <file>     Use specified Falconfile
   -j, --jobs <n>        Limit number of parallel jobs (default: unlimited)
   -C, --dir <dir>       Change directory before searching for Falconfile
       --parallel        Run target tasks in parallel
   -v, --version         Show version number
-  -h, --help            Show this help message
-`);
+  -h, --help            Show this help message`;
+}
+
+export interface CliOptions {
+  stdout?: { write: (str: string) => void };
+  stderr?: { write: (str: string) => void };
+  cwd?: string;
+  registry?: TaskRegistry;
 }
 
 /**
  * Parses CLI arguments, discovers and loads the Falconfile, and runs requested tasks.
+ * Returns an exit code (0 for success, 1 for error).
  */
 export async function cli(
   args: string[] = process.argv.slice(2),
-): Promise<void> {
-  const g = globalThis as Record<string, unknown>;
-  g.__FALCON_CLI__ = true;
+  io: CliOptions = {},
+): Promise<number> {
+  const stdout = io.stdout ?? process.stdout;
+  const stderr = io.stderr ?? process.stderr;
+  const cwd = io.cwd ?? process.cwd();
+  const registry = io.registry ?? defaultRegistry;
 
   const options = {
     list: {
@@ -450,128 +525,114 @@ export async function cli(
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(colors.red(`Error: ${message}`));
-    console.error("Run 'falcon --help' for usage.");
-    process.exitCode = 1;
-    return;
+    stderr.write(`Error: ${message}\nRun 'falcon --help' for usage.\n`);
+    return 1;
   }
 
   const { values, positionals } = parsed;
 
   if (values.help) {
-    printHelp();
-    return;
+    stdout.write(`${getHelpText()}\n`);
+    return 0;
   }
 
   if (values.version) {
-    console.log(`falcon v${getPackageVersion()}`);
-    return;
+    stdout.write(`falcon v${getPackageVersion()}\n`);
+    return 0;
   }
 
-  if (values.dir) {
-    try {
-      process.chdir(values.dir);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(
-        colors.red(
-          `Error: Cannot change directory to '${values.dir}': ${message}`,
-        ),
-      );
-      process.exitCode = 1;
-      return;
-    }
+  const workingDir = values.dir ? resolve(cwd, values.dir) : cwd;
+  if (values.dir && !existsSync(workingDir)) {
+    stderr.write(`Error: Directory does not exist: ${values.dir}\n`);
+    return 1;
   }
 
   if (values.jobs !== undefined) {
     const parsedJobs = Number(values.jobs);
     if (!Number.isFinite(parsedJobs) || parsedJobs < 1) {
-      console.error(
-        colors.red(
-          `Error: Invalid value for --jobs: "${values.jobs}". Must be a positive integer.`,
-        ),
+      stderr.write(
+        `Error: Invalid value for --jobs: "${values.jobs}". Must be a positive integer.\n`,
       );
-      process.exitCode = 1;
-      return;
+      return 1;
     }
-    setJobs(parsedJobs);
+    registry.setJobs(parsedJobs);
   }
 
-  // Load Falconfile if not already loaded or if a custom file is specified
   if (values.file || registry.size === 0) {
     let falconfilePath: string | null = null;
     try {
-      falconfilePath = findFalconfile(process.cwd(), values.file);
+      falconfilePath = findFalconfile(workingDir, values.file);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(colors.red(`Error: ${message}`));
-      process.exitCode = 1;
-      return;
+      stderr.write(`Error: ${message}\n`);
+      return 1;
     }
 
     if (!falconfilePath) {
-      console.error(
-        colors.red(
-          "Error: No Falconfile found in current or parent directories.",
-        ),
+      stderr.write(
+        "Error: No Falconfile found in current or parent directories.\n",
       );
-      process.exitCode = 1;
-      return;
+      return 1;
     }
 
     try {
-      await loadFalconfile(falconfilePath);
+      await loadFalconfile(falconfilePath, registry);
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.stack || err.message : String(err);
-      console.error(colors.red(`Error loading ${falconfilePath}:`));
-      console.error(message);
-      process.exitCode = 1;
-      return;
+      stderr.write(`Error loading ${falconfilePath}:\n${message}\n`);
+      return 1;
     }
   }
 
   if (values.list || values["list-alt"]) {
-    listTasks();
-    return;
+    stdout.write(`${registry.formatTaskList()}\n`);
+    return 0;
   }
 
   if (positionals.length > 0) {
     try {
       if (values.parallel) {
-        await Promise.all(positionals.map((target) => runTask(target)));
+        await Promise.all(
+          positionals.map((target) => registry.runTask(target)),
+        );
       } else {
         for (const target of positionals) {
-          await runTask(target);
+          await registry.runTask(target);
         }
       }
+      return 0;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(colors.red(`Error: ${message}`));
-      process.exitCode = 1;
-    }
-  } else {
-    if (registry.has("default")) {
-      try {
-        await runTask("default");
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(colors.red(`Error: ${message}`));
-        process.exitCode = 1;
-      }
-    } else {
-      listTasks();
+      stderr.write(`Error: ${message}\n`);
+      return 1;
     }
   }
+
+  if (registry.has("default")) {
+    try {
+      await registry.runTask("default");
+      return 0;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      stderr.write(`Error: ${message}\n`);
+      return 1;
+    }
+  }
+
+  stdout.write(`${registry.formatTaskList()}\n`);
+  return 0;
 }
 
 /**
  * Runs tasks specified in process.argv, or delegates to cli().
  */
 export async function run(): Promise<void> {
-  const g = globalThis as Record<string, unknown>;
-  if (g.__FALCON_CLI__) {
+  if (isLoadingFalconfile()) {
     return;
   }
-  await cli();
+  const exitCode = await cli();
+  if (exitCode !== 0 && typeof process !== "undefined") {
+    process.exitCode = exitCode;
+  }
 }
