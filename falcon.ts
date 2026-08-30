@@ -9,12 +9,12 @@ function sh(cmd: string, args: string[] = [], env: Record<string, string> = {}) 
   });
 }
 
-task("version", async () => {
+task("version", () => {
   const versionChangeTypes = ["major", "minor", "patch"];
   const versionChangeType = process.env.V || "";
   if (!versionChangeTypes.includes(versionChangeType)) {
     throw new Error(
-      `Invalid version change type: ${versionChangeType}. Must be one of: ${versionChangeTypes.join(
+      `Invalid version change type: V=${versionChangeType}. Must be one of: ${versionChangeTypes.join(
         ", "
       )}`
     );
@@ -25,7 +25,7 @@ task("version", async () => {
 
 });
 
-task("publish", ["version"], async () => {
+task("publish", () => {
   sh("npm", ["publish", "--access", "public"]);
 });
 
