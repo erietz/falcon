@@ -1,3 +1,5 @@
+// vim: ft=typescript
+
 import { execFileSync } from "node:child_process";
 import { run, task } from "./src/index.ts";
 
