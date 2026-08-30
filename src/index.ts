@@ -1,8 +1,15 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, extname, join, resolve } from "node:path";
+import {
+  copyFileSync,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import vm from "node:vm";
 
 const isColorSupported =
   !process.env.NO_COLOR &&
@@ -77,6 +84,20 @@ export class TaskRegistry {
     const parsed = Number(process.env.FALCON_JOBS);
     this.jobs =
       Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : Infinity;
+  }
+
+  private loadingCount = 0;
+
+  get isLoading(): boolean {
+    return this.loadingCount > 0;
+  }
+
+  startLoading(): void {
+    this.loadingCount++;
+  }
+
+  stopLoading(): void {
+    this.loadingCount = Math.max(0, this.loadingCount - 1);
   }
 
   get size(): number {
@@ -237,7 +258,11 @@ export class TaskRegistry {
   }
 }
 
-export const defaultRegistry = new TaskRegistry();
+const g = globalThis as Record<string, unknown>;
+if (!g.__FALCON_DEFAULT_REGISTRY__) {
+  g.__FALCON_DEFAULT_REGISTRY__ = new TaskRegistry();
+}
+export const defaultRegistry = g.__FALCON_DEFAULT_REGISTRY__ as TaskRegistry;
 
 /**
  * Sets the description for the next task to be registered.
@@ -383,14 +408,15 @@ export function findFalconfile(
   return null;
 }
 
-let loadingCount = 0;
-
 export function isLoadingFalconfile(): boolean {
-  return loadingCount > 0;
+  return defaultRegistry.isLoading;
 }
 
 /**
- * Loads a Falconfile, injecting globals and executing via dynamic import or vm.
+ * Loads a Falconfile, injecting globals and executing via dynamic import.
+ * If the file has no extension (e.g. `Falconfile`), it is loaded via a temporary `.ts`
+ * proxy file in the same directory so that TypeScript type stripping and ESM relative
+ * imports work seamlessly with zero external dependencies.
  */
 export async function loadFalconfile(
   filePath: string,
@@ -400,24 +426,43 @@ export async function loadFalconfile(
   const resolvedPath = resolve(filePath);
   const ext = extname(resolvedPath).toLowerCase();
 
-  loadingCount++;
+  registry.startLoading();
   try {
     if (ext === ".js" || ext === ".mjs" || ext === ".cjs" || ext === ".ts") {
       const fileUrl = pathToFileURL(resolvedPath).href;
       await import(fileUrl);
     } else {
-      const content = readFileSync(resolvedPath, "utf-8");
+      // Extensionless file (e.g. Falconfile, falconfile)
+      // To support TypeScript type stripping and ESM relative imports natively in Node.js,
+      // create a temporary .ts file in the same directory (or tmpdir as fallback)
+      const fileDir = dirname(resolvedPath);
+      const baseName = basename(resolvedPath);
+      const tempFileName = `.${baseName}.${Date.now()}.${process.pid}.ts`;
+      let tempPath = join(fileDir, tempFileName);
+
       try {
-        vm.runInThisContext(content, {
-          filename: resolvedPath,
-        });
+        copyFileSync(resolvedPath, tempPath);
       } catch {
-        const dataUrl = `data:text/javascript;base64,${Buffer.from(content).toString("base64")}`;
-        await import(dataUrl);
+        // Fallback to system tmpdir if local directory is not writable
+        tempPath = join(tmpdir(), tempFileName);
+        copyFileSync(resolvedPath, tempPath);
+      }
+
+      try {
+        const fileUrl = pathToFileURL(tempPath).href;
+        await import(fileUrl);
+      } finally {
+        try {
+          if (existsSync(tempPath)) {
+            unlinkSync(tempPath);
+          }
+        } catch {
+          // Ignore cleanup errors
+        }
       }
     }
   } finally {
-    loadingCount--;
+    registry.stopLoading();
   }
 }
 

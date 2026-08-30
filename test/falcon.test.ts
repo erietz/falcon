@@ -327,19 +327,23 @@ describe("Falcon Task Runner", () => {
       rmSync(testTempDir, { recursive: true, force: true });
     });
 
-    it("loads Falconfile via data URL fallback when needed", async () => {
+    it("loads Falconfile containing TypeScript syntax and types without extension", async () => {
       const falconfilePath = join(testTempDir, "Falconfile");
       writeFileSync(
         falconfilePath,
         `
-        export const x = 1;
-        task("from_esm_falconfile", () => {});
+        import { dirname } from "node:path";
+        desc("TypeScript in Falconfile");
+        task("ts_task", (ctx: any) => {
+          const pathStr: string = dirname("/a/b/c");
+        });
       `,
       );
 
       await loadFalconfile(falconfilePath);
       const registry = getRegistry();
-      assert.ok(registry.has("from_esm_falconfile"));
+      assert.ok(registry.has("ts_task"));
+      assert.equal(registry.get("ts_task")?.desc, "TypeScript in Falconfile");
 
       rmSync(testTempDir, { recursive: true, force: true });
     });
